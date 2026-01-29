@@ -1,0 +1,1 @@
+# Dipole-Configuration-Equilibrium-with-Flux-Conservation
