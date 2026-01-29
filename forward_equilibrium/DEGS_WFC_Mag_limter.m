@@ -1,0 +1,615 @@
+% DEGS_with flux consersation_ magnetic limiter configuration by:liu T
+% - magnetic limiter configuration with flux consersation - 
+% This configuration confines the expansion of the LCFS...
+% (Last Closed Flux Surface) through a magnetic field
+%% ---- magnetic limiter configuration ----- %%
+clear;clc;close all;
+%  ---- set the computational domain and mesh density settings ---- %
+nI = 8;NG = 2^nI + 1;nlay = nI - 1;NR = NG;NZ = NG;% number of grids and multigrid levels
+r1 = 0.0;r2 = 4.5;z1 = -1.7;z2 = 2.5; % computational domain
+c0 = 2e-7;mu0 = 4*pi*1e-7;            % Vacuum permeability c0 = mu0/2pi
+rr = linspace(r1,r2,NR);zz = linspace(z1,z2,NZ);
+dr = rr(2) - rr(1);dz = zz(2) - zz(1);dr2 = dr*dr;dz2 = dz*dz;ds = dr*dz;
+[R,Z] = ndgrid(rr,zz);
+
+% - coordinate grid at each level of the multigrid method,...
+%   along with the corresponding interpolation and restriction matrices - 
+[MRI] = MatRI(R,Z,nlay);
+
+% - Green's function between grids with boundary grids
+[GrE,indnb,nb] = Gree(rr,zz);%Columns are grid points; rows are boundary points
+nbr = indnb(1,:);nbz = indnb(2,:);
+
+% ---- L and D coils ----
+% - Coil position and number of turns -
+CR=[0.85 0.53];CZ=[2.1 0];LNR = 60;LNZ = 30;DNR = 40;DNZ = 40;
+% - Dimensions of the L-coil - 
+LW=0.3;LH=0.15;
+% - Dimensions of the D-coil - 
+DW = 0.16;DH = 0.16;
+% - Current of Coils 
+CJ = [4.7e5 4.77e6];
+% - Dipole coil and Levitated coil
+VCRD = linspace(CR(2) - DW/2,CR(2) + DW/2,DNR);
+VCZD = linspace(CZ(2) - DH/2,CZ(2) + DH/2,DNZ);
+VCRL = linspace(CR(1) - LW/2,CR(1) + LW/2,LNR);
+VCZL = linspace(CZ(1) - LH/2,CZ(1) + LH/2,LNZ);
+[CRD,CZD] = ndgrid(VCRD,VCZD);
+[CRL,CZL] = ndgrid(VCRL,VCZL);
+
+% ---- Auxiliary coil ---- 
+% Number of turns, position, and current of the coil
+CLDN = 10;CLDW = 0.1;
+CLDR =  [ 4.0  4.0 4.0 ];
+CLDZ =  [-0.5 -0.0 0.5 ]; 
+CLDI = -[ 3e2  5e2 8e2 ]*9.0;
+Coils = [];% Column 1: R-Position; Column 2: Z-Position; Column 3: Coil Current 
+for jc = 1:length(CLDI)
+    VCRO = linspace(CLDR(jc) - CLDW/2,CLDR(jc) + CLDW/2,CLDN);
+    VCZO = linspace(CLDZ(jc) - CLDW/2,CLDZ(jc) + CLDW/2,CLDN);
+    [TRD,TZD] = ndgrid(VCRO,VCZO);
+    Coils = [Coils;[{TRD},{TZD},{CLDI(jc)}]];% # coils are from bottom to top
+end
+% - assemble coils  （ L_Coil D_Coil Aux_Coils ）
+Coils = [[{CRL},{CZL},{CJ(1)}];[{CRD},{CZD},{CJ(2)}];Coils];
+Coils0 = Coils;
+
+% ---- Mutual Inductance Matrix and Self-Inductance ----
+[mDL] = FMI(CRD,CZD,CRL,CZL);  % The mutual inductance between D-Coil  and L-Coil
+[InD] = FSI(CRD,CZD);          % D-coil self-inductance
+[ncd,MuT] = MGC(R,Z,CRD,CZD);  % The mutual inductance between D-Coil and grids:Rows represent coils; columns represent grid
+
+% ---- Interpolate the coil currents onto the mesh ----
+[RHSC] = p2gv(Coils,rr,zz);
+% - Boundary conditions
+psibc = -mu0*GrE*reshape(RHSC,[],1);
+% - source term of the G-S
+RHSC   = mu0*R.*RHSC/ds;
+
+% ---- initial guess magnetic flux ----
+[PSIC] = MCVT(R,Z,Coils);
+
+%% ---- Plasma region and pressure profile initialization
+% - Initial magnetic flux through the D-coil
+tID  = CJ(2);tIL  = CJ(1);IT = tID*tIL;
+cp0 = InD*CJ(2)/(DNR*DNZ) + mDL*CJ(1)/(LNR*LNZ);
+% - 
+rDC = 0.15;RDC = 0.55; % major and minor radius of D-oil
+omeo = 0.6;            % SOR acceleration factor
+nt   = 200;            % Maximum number of iterations for inner loop
+tolo = 10^-9;          % Threshold condition for stopping iteration
+psiout = PSIC;         % guess flux
+rh = 1.5;              % location of peak pressure
+pp = 1.0e4;dp = 1000;p0 = pp; % peak pressure
+tmpi0 = 0.10e6;               % Target plasma current
+dcur = 1;                     % Relative error of current
+% - 
+dpso = 10*tolo;       % Error of the boundary                                                 
+dcp  = 1;             % Error of the flux through the D-coil
+ito  = 1;             % outer loop calculation
+
+
+% ---- Memory
+% - 3D matrixs (pressure, current density, flux)
+MPRE = [];
+MCUR = [];
+MPSI = [];
+% - vectors ( Coil currents & peak pressure & plasma beta )
+IR   = [];
+VP0  = [];
+VBet = [];
+% - 2D matrixs 
+% Convert the flux into a column and save it as a 2D matrix, checking... 
+% whether the current density and flux change abruptly during the iterations
+ncu  = 10; % Record every 10 inner-loop iterations.
+VPS  = []; % flux
+VCI  = []; % current density
+% - 
+IDLP = []; % Coil and plasma currents
+
+% ---- dentify interfaces and initialize pressure distribution -----
+tmpPSIC = psiout;
+[Mo1,Mi1,Ho,Hi,~] = SIPS(tmpPSIC,RDC,rDC,R,Z); % outer and inner separatrix, plasma region Hi.*Ho
+Mi=Mi1;Mo=Mo1; % Initial inner and outer plasma edges
+
+% - pressure profiles
+mp = 3; % Select pressure distribution
+if ( mp == 1 ) % Davis "Pressure profiles of plasmas confined in the field of a dipole magnet"
+    tmpPSIC = Hi.*Ho.*psiout;mxpsic=max(tmpPSIC(tmpPSIC~=0));mnpsic=min(min(tmpPSIC));
+    zh = 0;dnh = floor(0.05/dr)+1; % Width of transition area at middle plane
+    rhnu=floor((rh-r1)/dr+2);
+    zhnu=floor((zh-z1)/dz+1);
+    psih=tmpPSIC(rhnu,zhnu);      % flux on peak pressure
+    dpsim=tmpPSIC(rhnu+dnh,zhnu); % Flux on right of the transition area
+    dpsip=tmpPSIC(rhnu-dnh,zhnu); % Flux on left of the transition area
+    % - Calculate coefficients A B C - 
+    g = 2.56;alp = 4*g*(abs(mnpsic/psih)-1);
+    MCA=[2*dpsip 1 0;2*dpsim 1 0;dpsip^2 dpsip 1;dpsim^2 dpsim 1];
+    MCB=[alp*p0/(psih-mnpsic)*((dpsip-mnpsic)/(psih-mnpsic))^(alp-1);
+         4*g*p0/psih*(dpsim/psih)^(4*g-1);
+         p0*((dpsip-mnpsic)/(psih-mnpsic))^alp;
+         p0*(dpsim/psih)^(4*g)];
+    TFC=MCA\MCB;
+    % - pressure ad current density on plasma region -
+    indk = find( tmpPSIC <= dpsip );
+    tmpP1(indk) = p0*((tmpPSIC(indk)-mnpsic)/(psih-mnpsic)).^(alp);
+    tmpJ1(indk) = -alp*p0/(psih-mnpsic)*R(indk).*((tmpPSIC(indk)-mnpsic)./(psih-mnpsic)).^(alp-1);
+    indk = find( tmpPSIC > dpsip & tmpPSIC <= dpsim );CAT
+    tmpP1(indk) = TFC(1)*tmpPSIC(indk).^2+TFC(2)*tmpPSIC(indk)+TFC(3);
+    tmpJ1(indk) = -R(indk).*(2*TFC(1)*tmpPSIC(indk)+TFC(2));
+    indk = find( tmpPSIC > dpsim );
+    tmpP1(indk) = p0*(tmpPSIC(indk)/psih).^(4*g);
+    tmpJ1(indk) = -4*g*p0*R(indk)/psih.*(tmpPSIC(indk)/psih).^(4*g-1);
+    tmpP1 = reshape(tmpP1,NR,NZ);
+    tmpJ1 = reshape(tmpJ1,NR,NZ);
+elseif ( mp == 2 )
+    % - Third Tpye Pressure  &  Current Profile ( D. T. Garnier 1999 )
+    tmpPSIC0 = Hi.*Ho.*psiout;mxpsic=max(tmpPSIC0(tmpPSIC0~=0));mnpsic=min(min(tmpPSIC0));
+    tmpP1=0.5*p0*(1-cos(2*pi*(psiout-mxpsic)/(mnpsic-mxpsic)));
+    tmpJ1=R.*p0*pi/(mxpsic-mnpsic).*sin(2*pi*(psiout-mxpsic)./(mnpsic-mxpsic));
+
+elseif( mp == 3 )
+    tmpPSIC = Hi.*Ho.*psiout;mxpsic=max(tmpPSIC(tmpPSIC~=0));mnpsic=min(min(tmpPSIC));
+    zh = 0;dnh = floor(0.1/dr)+1;% Width of transition area at middle plane
+    rhnu=floor((rh-r1)/dr+2);
+    zhnu=floor((zh-z1)/dz+1);
+    psih=tmpPSIC(rhnu,zhnu);      
+    dpsim=tmpPSIC(rhnu+dnh,zhnu); 
+    dpsip=tmpPSIC(rhnu-dnh,zhnu); 
+    % - Calculate coefficients A B C D- 
+    g = 2.0;alp = 4*g*(abs(mnpsic/psih)-1);
+    MCL = [ dpsip^3  dpsip^2 dpsip 1;
+            dpsim^3  dpsim^2 dpsim 1;
+            3*dpsip^2 2*dpsip   1   0;
+            3*dpsim^2 2*dpsim   1   0];
+    MCR = [ p0*((dpsip-mnpsic)/(psih-mnpsic))^alp;
+            p0*(dpsim/psih)^(4*g);
+            alp*p0/(psih-mnpsic)*((dpsip-mnpsic)/(psih-mnpsic))^(alp-1);
+            4*g*p0/psih*(dpsim/psih)^(4*g-1)];
+    TFC = MCL\MCR;
+    % - pressure ad current density on plasma region -
+    indk = find( tmpPSIC <= dpsip );
+    tmpP1(indk) = p0*((tmpPSIC(indk)-mnpsic)/(psih-mnpsic)).^alp;
+    tmpJ1(indk) = -alp*p0/(psih-mnpsic)*R(indk).*((tmpPSIC(indk)-mnpsic)./(psih-mnpsic)).^(alp-1);
+    indk = find( tmpPSIC > dpsip & tmpPSIC <= dpsim );
+    tmpP1(indk) = TFC(1)*tmpPSIC(indk).^3 + TFC(2)*tmpPSIC(indk).^2 + TFC(3)*tmpPSIC(indk) + TFC(4);
+    tmpJ1(indk) = -R(indk).*(3*TFC(1)*tmpPSIC(indk).^2 + 2*TFC(2)*tmpPSIC(indk) + TFC(3));
+    indk = find( tmpPSIC > dpsim );
+    tmpP1(indk) = p0*(tmpPSIC(indk)/psih).^(4*g);
+    tmpJ1(indk) = -4*g*p0*R(indk)/psih.*(tmpPSIC(indk)/psih).^(4*g-1);
+    tmpP1 = reshape(tmpP1,NR,NZ);
+    tmpJ1 = reshape(tmpJ1,NR,NZ);
+end
+
+% - identified physical regions
+tmpP1 = Hi.*Ho.*tmpP1;
+tmpJ1 = Hi.*Ho.*tmpJ1;
+tmpI1 = sum(sum(tmpJ1))*ds
+RHSJ = mu0*R.*tmpJ1;
+
+% - compute boundary condition (plasma) 
+psibp = -mu0*ds*GrE*reshape(tmpJ1,[],1);
+
+% - SOR algorithm register
+RHSC1  = RHSC;RHSC2 = RHSC;    % soure term of coils
+psibc1 = psibc;psibc2 = psibc; % boundary condition of coils
+psibp1 = psibp;psibp2 = psibp; % boundary condition of plasma current
+%% ---- major loop ----- 
+while( dpso >= tolo || dcp >= 1e-4 || dcur >= 1e-5 || dpsi >= tolo)% boundary flux; flux through D-coil; target current; internal flux 
+    
+    % - update soure terms
+    RHS = RHSC + RHSJ;
+    
+    % update boundary condition
+    psib = psibc + psibp;
+    for j = 1:nb
+        psiout(nbr(j),nbz(j)) = psib(j);
+    end
+    
+    % - inner loop initialize
+    iti  = 1;       % count
+    toli = 10^-10;   % threshold
+    dpsi = 10*toli; % error
+    omei = 0.6;     % SOR acc factor
+    NIT  = 4;       % iteration number
+    %
+    psi0 = psiout;psit = psiout;
+    while ( iti <= nt && dpsi >= toli )
+        % ------- SOR --------
+        [psit,RES] = GSSOR2(psi0,RHS,R,Z,psib,nbr,nbz,NIT,omei);
+        dpsi = max(max(abs(psit(2:end-1,2:end-1) - psi0(2:end-1,2:end-1))));
+        % ------ MG Acc -------
+        [psi0] = MGSOR2(psit,RES,MRI,NIT,omei);
+        % ---- Separatrix -----
+        [Mo,Ho,~] = SIPSO(psi0,R,Z,Hi);
+        % ---- Pressure profile ----
+        if ( mp == 1 )
+            tmpPSIC0 = Hi.*Ho.*psi0;
+            mxpsic = max(tmpPSIC0(tmpPSIC0~=0));mnpsic = min(min(tmpPSIC0));
+            psih=psi0(rhnu,zhnu);      
+            dpsim=psi0(rhnu+dnh,zhnu); 
+            dpsip=psi0(rhnu-dnh,zhnu); 
+            alp = 4*g*(abs(mnpsic/psih)-1);
+            MCA=[2*dpsip 1 0;2*dpsim 1 0;dpsip^2 dpsip 1;dpsim^2 dpsim 1];
+            MCB=[alp*p0/(psih-mnpsic)*((dpsip-mnpsic)/(psih-mnpsic))^(alp-1);
+                4*g*p0/psih*(dpsim/psih)^(4*g-1);
+                p0*((dpsip-mnpsic)/(psih-mnpsic))^alp;
+                p0*(dpsim/psih)^(4*g)];
+            TFC=MCA\MCB;
+            indk = find( psi0 >= mnpsic & psi0 <= dpsip );
+            tmpP1(indk) = p0*((psi0(indk)-mnpsic)/(psih-mnpsic)).^alp;
+            tmpJ1(indk) = -alp*p0/(psih-mnpsic)*R(indk).*((psi0(indk)-mnpsic)./(psih-mnpsic)).^(alp-1);
+            indk = find( psi0 > dpsip & psi0 <= dpsim );
+            tmpP1(indk) = TFC(1)*psi0(indk).^2+TFC(2)*psi0(indk)+TFC(3);
+            tmpJ1(indk) = -R(indk).*(2*TFC(1)*psi0(indk)+TFC(2));
+            indk = find( psi0 > dpsim );
+            tmpP1(indk) = p0*(psi0(indk)/psih).^(4*g);
+            tmpJ1(indk) = -4*g*p0*R(indk)/psih.*(psi0(indk)/psih).^(4*g-1);
+        elseif ( mp == 2 )
+            tmpPSIC0 = Hi.*Ho.*psi0;
+            mxpsic = max(tmpPSIC0(tmpPSIC0~=0));
+            mnpsic = min(min(tmpPSIC0));
+
+            tmpP1 = 0.5*p0*(1-cos(2*pi*(psi0-mxpsic)/(mnpsic-mxpsic)));
+            tmpJ1 = R.*p0*pi/(mxpsic-mnpsic).*sin(2*pi*(psi0-mxpsic)./(mnpsic-mxpsic));
+        elseif ( mp == 3 )
+            tmpPSIC0 = Hi.*Ho.*psi0;
+            mxpsic = max(tmpPSIC0(tmpPSIC0~=0));mnpsic = min(min(tmpPSIC0));
+            psih=psi0(rhnu,zhnu);      
+            dpsim=psi0(rhnu+dnh,zhnu); 
+            dpsip=psi0(rhnu-dnh,zhnu);
+            alp = 4*g*(abs(mnpsic/psih)-1);
+            MCL = [ dpsip^3  dpsip^2 dpsip 1;
+                dpsim^3  dpsim^2 dpsim 1;
+                3*dpsip^2 2*dpsip   1   0;
+                3*dpsim^2 2*dpsim   1   0];
+            MCR = [ p0*((dpsip-mnpsic)/(psih-mnpsic))^alp;
+                p0*(dpsim/psih)^(4*g);
+                alp*p0/(psih-mnpsic)*((dpsip-mnpsic)/(psih-mnpsic))^(alp-1);
+                4*g*p0/psih*(dpsim/psih)^(4*g-1)];
+            TFC = MCL\MCR;
+            % -
+            indk = find( psi0 <= dpsip ); 
+            tmpP1(indk) = p0*((psi0(indk)-mnpsic)/(psih-mnpsic)).^alp;
+            tmpJ1(indk) = -alp*p0/(psih-mnpsic)*R(indk).*((psi0(indk)-mnpsic)./(psih-mnpsic)).^(alp-1);
+
+            indk = find( psi0 > dpsip & psi0 <= dpsim );
+            tmpP1(indk) = TFC(1)*psi0(indk).^3 + TFC(2)*psi0(indk).^2 + TFC(3)*psi0(indk) + TFC(4);
+            tmpJ1(indk) = -R(indk).*(3*TFC(1)*psi0(indk).^2 + 2*TFC(2)*psi0(indk) + TFC(3));
+
+            indk = find( psi0 > dpsim );
+            tmpP1(indk) = p0*(psi0(indk)/psih).^(4*g);
+            tmpJ1(indk) = -4*g*p0*R(indk)/psih.*(psi0(indk)/psih).^(4*g-1);
+        end
+        
+        % ---- Source term ----
+        tmpP1 = tmpP1.*Hi.*Ho;
+        tmpJ1 = tmpJ1.*Hi.*Ho;
+        tmpI1 = sum(sum(tmpJ1))*ds;
+        RHSJ  = mu0*R.*tmpJ1;
+        
+        RHS = RHSC + RHSJ;
+        iti = iti + NIT*nlay; %     
+
+    end
+
+    psiout = psi0;% update psi
+    
+    % - Record the current and plasma pressure
+    IDLP = [IDLP,[tID;tIL;tmpI1]];
+    VP0  = [VP0,p0];
+
+    % - Update the coil current based on conservation conditions
+    pdm = ds*sum(MuT*reshape(tmpJ1,[],1));
+    tcp = tID*InD/(DNR*DNZ)  +  tIL*mDL/(LNR*LNZ)  +  pdm;
+    dcp = abs(tcp - cp0)/tcp;
+    lam = cp0/tcp;
+    tID = lam*tID;
+    tIL = IT/tID;
+    
+    % - compute boundary condition (plasma current)
+    psibp2 = psibp1;
+    psibp1 = -mu0*ds*GrE*reshape(tmpJ1,[],1);
+    psibp = omeo*psibp1 + (1 - omeo)*psibp2;
+    
+	% - record and update coil currents
+    Coils(1:2,3) = [{tIL};{tID}];
+    RHSC2   = RHSC1;
+    [RHSC1] = p2gv(Coils,rr,zz);
+    RHSC    = omeo*RHSC1 + (1 - omeo)*RHSC2;
+    % - compute boundary condition (coils current)
+    psibc  = -mu0*GrE*reshape(RHSC,[],1);
+    RHSC   = mu0*R.*RHSC/ds;
+
+    % - error of boundary magnetic flux
+    dpso = max( max(abs(psibp2 - psibp1)) , max(abs(psibc2 - psibc1)) );
+    
+    if ( ito > 3 ) % Constrain the maximum allowable pressure
+        p0s = tmpi0/IDLP(3,ito)*VP0(ito); % update peak pressure
+        if ( p0s > 0.60e4 || p0s <= 0 )
+            p0s = 0.599e4;
+        end
+        p0 = (1-omeo)*VP0(ito) + omeo*p0s;
+    end
+
+    dcur = abs(IDLP(3,ito) - tmpi0)/abs(tmpi0); % error between the plasma and target currents
+
+    if ( mod(ito,5) == 0 )
+        disp(['outer loop error = ',num2str(dpso)]);
+        disp(['I_{plasma} = ',num2str(tmpI1)]);
+        %disp(['ψ0/ψi = ',num2str(lam, '%.3f')]);
+        %disp(['Process = ',num2str(1 - tolo/dpso ),'%'])
+    end
+
+    ito = ito + 1;
+end
+%% ---- Diagnostics ----
+
+subplot(1,2,1) % magnetic flux
+[~,ch1] = contour(R,Z,-psiout/min(min(psiout)),40,'linewidth',1.5);hold on;
+
+% separatrix
+indmo = find(Mo(1,:)<0);
+
+if (length(indmo) == 1)
+h1 = plot(Mo(1,2:end),Mo(2,2:end),'--m','linewidth',2);hold on;
+elseif ( length(indmo) == 2 )
+h1 = plot(Mo(1,indmo(1)+1:indmo(2)-1),Mo(2,indmo(1)+1:indmo(2)-1),'--m','linewidth',2);hold on;
+     plot(Mo(1,indmo(2)+1:end),Mo(2,indmo(2)+1:end),'--m','linewidth',2);
+else    % the two longest separatrix lines
+indmo1 = [indmo,length(Mo(1,:))];dindmo1 = diff(indmo1);dindmo1=[dindmo1;1:length(dindmo1)];
+ind = find ( diff(indmo1) == max(diff(indmo1)) );
+h1 = plot(Mo(1,indmo(ind)+1:indmo(ind)+Mo(2,indmo(ind))),...
+          Mo(2,indmo(ind)+1:indmo(ind)+Mo(2,indmo(ind))),'--m','linewidth',2);hold on;
+plot(Mo(1,indmo(ind)+1:indmo(ind)+Mo(2,indmo(ind))),...
+          -Mo(2,indmo(ind)+1:indmo(ind)+Mo(2,indmo(ind))),':g','linewidth',2);hold on;
+dindmo1(:,ind) = [];ind2 = dindmo1(2,find(dindmo1(1,:)==max(dindmo1)));
+plot(Mo(1,indmo(ind2)+1:Mo(2,indmo(ind2))+indmo(ind2)),...
+     Mo(2,indmo(ind2)+1:Mo(2,indmo(ind2))+indmo(ind2)),'--m','linewidth',2);
+end
+
+% - plot target board
+indtb = 2+floor((size(Coils,1)-2)/2)+1;
+tb = cell2mat(Coils(indtb,1));
+tbr = linspace(max(max(tb))+0.1,r2,64);
+tbz = max(max(cell2mat(Coils(indtb,2)))) + min(min(cell2mat(Coils(indtb,2))));
+plot(tbr,tbz/2*ones(size(tbr)),'-k','linewidth',4);
+
+% Calculate the width of the scrape-off layer.
+pd1r=cell2mat(Coils(3,1));
+pd1z=cell2mat(Coils(3,2));
+pd2r=cell2mat(Coils(5,1));
+pd2z=cell2mat(Coils(5,2));
+
+pd1p1=interp2(R',Z',psiout',pd1r(1,end),pd1z(1,end));
+pd1p2=interp2(R',Z',psiout',pd1r(end,end),pd1z(end,end));
+pd1p3=interp2(R',Z',psiout',pd1r(1,1),pd1z(1,1));
+pd1p4=interp2(R',Z',psiout',pd1r(end,1),pd1z(end,1));
+dp1p = min([pd1p1 pd1p2 pd1p3 pd1p4]);
+pd2p1=interp2(R',Z',psiout',pd2r(1,end),pd2z(1,end));
+pd2p2=interp2(R',Z',psiout',pd2r(end,end),pd2z(end,end));
+pd2p3=interp2(R',Z',psiout',pd2r(1,1),pd2z(1,1));
+pd2p4=interp2(R',Z',psiout',pd2r(end,1),pd2z(end,1));
+dp2p = min([pd2p1 pd2p2 pd2p3 pd2p4]);
+
+% Magnetic flux at the outermost surface of the target plate
+dp3p = interp2(R',Z',psiout',max(tbr),tbz/2);
+tpsit = max([dp3p min([dp1p dp2p])]);
+MS = contourc(rr,zz,psiout',[min([dp1p dp2p dp3p]) min([dp1p dp2p dp3p])]);
+
+% plot SOL
+inds  = find(MS(1,:)<0);
+indms = [inds,length(MS)];
+indd  = find(diff(indms) == max(diff(indms)));
+plot(MS(1,inds(indd)+1:MS(2,inds(indd))+inds(indd)),...
+     MS(2,inds(indd)+1:MS(2,inds(indd))+inds(indd)),'--r','linewidth',2)
+
+% - plot coils 
+cola = 0; % Adjust the color of the plotted coil
+for jcc = 1:size(Coils,1)
+    tCRD = cell2mat(Coils(jcc,1));tCZD = cell2mat(Coils(jcc,2));tCI = cell2mat(Coils(jcc,3));
+    plot(tCRD(1,:),tCZD(1,:),'-','linewidth',1.5,'color',cola*[1 1 1]);
+    plot(tCRD(end,:),tCZD(end,:),'-','linewidth',1.5,'color',cola*[1 1 1]);
+    plot(tCRD(:,1),tCZD(:,1),'-','linewidth',1.5,'color',cola*[1 1 1]);
+    plot(tCRD(:,end),tCZD(:,end),'-','linewidth',1.5,'color',cola*[1 1 1]);
+    tmpDR1 = linspace(min(min(tCRD)),max(max(tCRD)),20);
+    tmpDZ1 = linspace(min(min(tCZD)),max(max(tCZD)),20);
+    plot(tmpDR1,tmpDZ1,'-','linewidth',1.5,'color',cola*[1 1 1]);
+    plot(tmpDR1,flip(tmpDZ1),'-','linewidth',1.5,'color',cola*[1 1 1]);
+end
+
+% - set axis font
+set(gca,'TickLabelInterpreter','latex',"FontSize",16);
+ylabel('$\rm\ Z\ (\rm m)$','Interpreter','latex',"FontSize",16);
+xlabel('$\rm\ R\ (\rm m)$','Interpreter','latex',"FontSize",16);
+% - set superscript
+tx=text(5*rr(2),0.89*z2,'$\rm (a)$','interpreter','latex');
+tx.FontSize= 18;
+tx.FontName= 'Times';
+set(tx,'layer','front');
+% - legend
+L1=legend([ch1 h1],{'$\psi$','Separatrix'},"Interpreter","latex","FontSize",16,'FontName','times');
+set (L1,'box','off')
+set(gca,'TickLabelInterpreter','latex','fontsize',16);
+
+
+% - The profile of pressure and density at mid-plane
+subplot(1,2,2)
+% mid-plane
+mpr1 = max(Mi(1,2:end));
+indmo = find(Mo(1,:)<0);
+indmo1 = [indmo,length(Mo(1,:))];dindmo1 = diff(indmo1);dindmo1=[dindmo1;1:length(dindmo1)];
+ind = find ( diff(indmo1) == max(diff(indmo1)) );
+
+mpr2 = max(Mo(1,indmo(ind)+1:indmo(ind)+Mo(2,indmo(ind))));
+
+indmpr1 = floor((mpr1 - r1)/dr)+2;
+indmpr2 = floor((mpr2 - r1)/dr)-5;
+indmpr  = indmpr1:indmpr2;
+indmpz  = find(zz>0,1);
+
+yyaxis left  % pressure
+plot(R(indmpr,indmpz),tmpP1(indmpr,indmpz)/1000,'-b','linewidth',2);
+ylabel('$\rm\ pressure\ (\rm kPa)$','Interpreter','latex',"FontSize",16);
+
+yyaxis right % density
+indrh = floor((rh-r1)/dr) + 1;
+unind = indmpr1:indrh;
+fvind = indrh+1:indmpr2;
+% inner side of peak pressure is uniformly distributed
+% determine the maximum number density: omegap = omegan
+[BBV,BBR,BBZ] = GradBB(psiout,R,Z);
+nmax = 10^5*(BBV(indrh,indmpz)*1000)^2;% cm^-3
+Vnmax = 0*rr;Vnmax(unind) = nmax;
+% outer side of peak pressure is \nabla(nV) = 0
+[Vfv] = FTV(psiout,BBR,BBZ,R,Z,psiout(fvind,indmpz));
+% 将NAN的部分差值
+intind = find(isnan(Vfv) == 1);
+Vfv(intind) = interp1(1:length(Vfv),Vfv',intind','spline');
+vfc = nmax*Vfv(1);
+Vnmax(fvind) = vfc./Vfv;
+%
+plot(R(indmpr,indmpz),Vnmax(indmpr),'-r','linewidth',2)
+
+% - set axis
+set(gca,'TickLabelInterpreter','latex',"FontSize",16);
+ylabel('$\rm\ density\ (\rm cm^-3)$','Interpreter','latex',"FontSize",16);
+xlabel('$\rm\ R\ (\rm m)$','Interpreter','latex',"FontSize",16);
+% - display range of figure
+grid on;box on;grid minor;
+axis([min(R(indmpr,indmpz)) max(R(indmpr,indmpz)) 1.0*min(Vnmax(indmpr)) 1.02*max(Vnmax(indmpr))]);
+
+% - superscript
+tx=text(1.05*min(R(indmpr,indmpz)),0.95*max(Vnmax(indmpr)),'$\rm (b)$','interpreter','latex');
+tx.FontSize= 18;
+tx.FontName= 'Times';
+set(tx,'layer','front');
+
+% - plasma parameters
+ttmp=tmpP1(indmpr,indmpz)/1000;
+pmax=max(ttmp)
+nmax=max(Vnmax(indmpr))
+pmin=min(ttmp(end))
+nmin=min(Vnmax(indmpr))
+% width of SOL
+WSOR = abs(max(MS(1,:)) - max(Mo(1,:)))
+
+
+%% save figures
+% saveas(gcf,['divertor_I = ',num2str(CLDI(2)/1000,'%.1f'),'kA.svg'])
+% saveas(gcf,['divertor_I = ',num2str(CLDI(2)/1000,'%.1f'),'kA.png'])
+% saveas(gcf,['divertor_I = ',num2str(CLDI(2)/1000,'%.1f'),'kA.jpg'])
+% save(['divertor_I = ',num2str(CLDI(2)/1000,'%.1f'),'kA.mat'])
+
+%% ---- coil and plasma currents vary with iteration
+h1=plot((IDLP(1,:)-CJ(2))/CJ(2),'-r','linewidth',2);hold on;
+h2=plot((IDLP(2,:)-CJ(1))/CJ(2),'--b','linewidth',2);
+h3=plot((IDLP(3,:)-IDLP(3,1))/CJ(2),'-.g','linewidth',2);
+plot(1:length(IDLP(1,:)),zeros(size(IDLP(1,:))),':m','linewidth',2);
+axis tight;grid on; box on ;grid minor;
+L1=legend([h1 h2 h3],{'$I_D$', '$I_L$','$I_p$'},"Interpreter","latex","FontSize",18,'FontName','times');
+set(gca,'TickLabelInterpreter','latex','fontsize',18);
+set (L1,'box','off')
+xlabel('Iteration Number','fontname','times')
+ylabel('Relative Current Change Rate','fontname','times')
+
+%% ---- Output the data required for equilibrium reconstruction ---- %%
+% - Select fixed points along the plasma boundary
+plot(Mo(1,2:end),Mo(2,2:end),'.m','linewidth',2);axis([r1 r2 z1 z2]);hold on;
+clear GrE;clear MuT;
+[~,beta1,~] = GradB(psiout,tmpP1,R,Z);
+% - identify separatrix
+indsp = find(Mo(1,:)<0);
+indsp = [indsp,length(Mo)];[~,indspo] = max(diff(indsp));
+indmo = indsp(indspo) + 1:indsp( indspo + 1 ) - 1;
+% - compute magnetic field along separatrix
+tmpsep = [Mo(1,indmo);Mo(2,indmo)];
+[FBR,FBZ,DFBR,DFBZ] = GradFB(tmpsep,psiout,R,Z,dr,dz);
+[~,indmbb] = min(FBR.^2 + FBZ.^2);% position of x point (x point is first fixed point)
+% - determine fixed points (select fixed points at equal intervals along separatrix)
+np = 46;% number of fixed point
+indtmp  = indmo(1:floor(length(indmo)/np):end);
+indtmp1 = indtmp+indmbb-indtmp(1);             
+tmptmpind = find(indtmp1 > indtmp(end));       
+indtmp1(tmptmpind) = indtmp1(tmptmpind) - indtmp(end);
+% - first and second rows correspond to the R and Z of fixed points
+Sep = [tmpsep(1,indtmp1(1:end-1));tmpsep(2,indtmp1(1:end-1))];
+
+% Calculate flux and transverse and longitudinal magnetic field at fixed points
+psisep = interp2(R',Z',psiout',Sep(1,:),Sep(2,:));
+[FBR,FBZ,DFBR,DFBZ] = GradFB(Sep,psiout,R,Z,dr,dz); 
+Sep = [Sep;psisep;FBR;FBZ;DFBR;DFBZ]; % add fixed points information
+
+% plot fixed points
+plot(Sep(1,1),Sep(2,1),'xg','markersize',15,'linewidth',3);
+plot(Sep(1,2:end),Sep(2,2:end),'xb','markersize',15,'linewidth',3);
+mesh(R,Z,psiout);hold on;
+plot3(Sep(1,:),Sep(2,:),Sep(3,:),'or','markersize',15,'linewidth',3);
+grid on;
+set(gca,'FontName','Times','FontSize',18);
+set(gca,'TickLabelInterpreter','latex');
+xlabel('$R\ (\rm m)$','Interpreter','latex',"FontSize",18);
+ylabel('$Z\ (\rm m)$','Interpreter','latex',"FontSize",18);
+zlabel('$\psi_{plasma}\ (\rm m)$','Interpreter','latex',"FontSize",18);
+title({'\psi & and Fixed plasma boundary position '})
+
+% ---- output data for equilibrium reconstruction
+CPLA =  cat(3,psiout,tmpP1,tmpJ1,beta1);%flux,pressure,current density,beta
+save(['sep_points_mag_limiter_',num2str(np),'.mat'],'Sep','Mo','IDLP','Coils0','CPLA');
+
+
+%% ----- Select fixed points along the potential detector positions ---- %%
+% - plot separatrix
+plot(Mo(1,2:end),Mo(2,2:end),'.m','linewidth',2);axis([r1 r2 z1 z2]);hold on;
+clear GrE;clear MuT;
+[~,beta1,~] = GradB(psiout,tmpP1,R,Z);
+
+% identify separatrix
+indsp = find(Mo(1,:)<0);
+indsp = [indsp,length(Mo)];[~,indspo] = max(diff(indsp));
+indmo = indsp(indspo) + 1:indsp( indspo + 1 ) - 1;
+% compute magnetic field along separateix
+tmpsep = [Mo(1,indmo);Mo(2,indmo)];
+[FBR,FBZ,DFBR,DFBZ] = GradFB(tmpsep,psiout,R,Z,dr,dz);
+[~,indmbb] = min(FBR.^2 + FBZ.^2);
+
+%  ---- The horizontal and vertical positions of point X
+xpoint = tmpsep(:,indmbb);
+% - arrange fixed points 
+ddd = 0.1; % minimum distance from the fixed points to the interface
+tmpr1 = linspace(xpoint(1),max(tmpsep(1,:))+ddd,128);
+tmpz1 = (max(tmpsep(2,:))+ddd) * ones(size(tmpr1));
+tmpz2 = linspace(max(tmpsep(2,:))+ddd,min(tmpsep(2,:))-ddd,128);
+tmpr2 = (max(tmpsep(1,:))+ddd) * ones(size(tmpz2));
+tmpr3 = linspace(max(tmpsep(1,:))+ddd,1,128);
+tmpz3 = (min(tmpsep(2,:))-ddd) * ones(size(tmpr3));
+vdl = [tmpr1,tmpr2(2:end-1),tmpr3;tmpz1,tmpz2(2:end-1),tmpz3];
+
+n = 48; % number of fixed points
+fdind = randi(10);
+gapnp = round(length(vdl(1,fdind:end))/n);
+inddd = fdind:gapnp:length(vdl);
+Sep   = vdl(:,inddd(1:n));
+% ------------------------------------------------------------------------%
+
+% - Calculate flux and the transverse and longitudinal magnetic field at fixed points
+psisep = interp2(R',Z',psiout',Sep(1,:),Sep(2,:));
+[FBR,FBZ,DFBR,DFBZ] = GradFB(Sep,psiout,R,Z,dr,dz); 
+Sep = [Sep;psisep;FBR;FBZ;DFBR;DFBZ];
+
+% - plot fixed points
+plot(Sep(1,1),Sep(2,1),'xg','markersize',15,'linewidth',3);
+plot(Sep(1,2:end),Sep(2,2:end),'xb','markersize',15,'linewidth',3);
+mesh(R,Z,psiout);hold on;
+plot3(Sep(1,:),Sep(2,:),Sep(3,:),'or','markersize',15,'linewidth',3);
+grid on;
+set(gca,'FontName','Times','FontSize',18);
+set(gca,'TickLabelInterpreter','latex');
+xlabel('$R\ (\rm m)$','Interpreter','latex',"FontSize",18);
+ylabel('$Z\ (\rm m)$','Interpreter','latex',"FontSize",18);
+zlabel('$\psi_{plasma}\ (\rm m)$','Interpreter','latex',"FontSize",18);
+title({'\psi & and Fixed plasma boundary position '})
+
+% ---- input data for equilibrium reconstruction
+CPLA =  cat(3,psiout,tmpP1,tmpJ1,beta1);
+save(['sep_points_mag_limiter_',num2str(n),'.mat'],'Sep','Mo','IDLP','Coils0','CPLA');

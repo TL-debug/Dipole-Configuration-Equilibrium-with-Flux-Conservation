@@ -1,0 +1,24 @@
+function [MR,MI,MRB,MIB] = RB2D(RHS)
+    X=RHS(2:end-1,1);
+	nint=length(X);
+    e=ones(1,(nint-1)/2);
+    indrow=1:(nint-1)/2;
+    indcol=[2.*indrow-1;2.*indrow;2.*indrow+1];
+    indval=[e;2*e;e];
+    Mint=sparse(indrow,indcol(1,:),indval(1,:),(nint-1)/2,nint)+...
+         sparse(indrow,indcol(2,:),indval(2,:),(nint-1)/2,nint)+...
+         sparse(indrow,indcol(3,:),indval(3,:),(nint-1)/2,nint);
+    MtmpR=Mint/4;
+    MR=kron(MtmpR,MtmpR);
+    MI=2*MR';
+    sz=size(MtmpR);
+    M1=[1,zeros(1,sz(2)),0;
+        zeros(sz(1),1),MtmpR,zeros(sz(1),1);
+        0,zeros(1,sz(2)),1];
+    MRB=kron(M1,M1);
+    MtmpI=Mint'/2;
+    sz=size(MtmpI);
+    M2=[1,zeros(1,sz(2)),0;
+        zeros(sz(1),1),MtmpI,zeros(sz(1),1);
+        0,zeros(1,sz(2)),1];
+    MIB=kron(M2,M2);
